@@ -40,6 +40,35 @@ Another real-world use-case is the [`yt-live`](examples/yt-live/main.go) example
 
 Other examples for the [`Objects`](https://pkg.go.dev/github.com/xarantolus/jsonextract#Objects) method can be found in the documentation.
 
+### Streaming extraction
+While [`Reader`](https://pkg.go.dev/github.com/xarantolus/jsonextract#Reader) only passes the converted JSON bytes to its callback, the lower-level [`Stream`](https://pkg.go.dev/github.com/xarantolus/jsonextract#Stream) function is a true streaming extractor. It reads the input incrementally and only keeps the bytes of the object or array currently being scanned in memory, so inputs much larger than the available memory work as long as a single fragment still fits.
+
+For every successfully extracted object or array it reports an [`Object`](https://pkg.go.dev/github.com/xarantolus/jsonextract#Object) containing:
+
+* `Raw`: the converted, valid JSON bytes (the same bytes `Reader` returns)
+* `Source`: the original source bytes
+* `Start` and `End`: byte offsets of the half-open interval `[Start, End)` the object occupies in the input stream
+
+Fragments that start with `{` or `[` but cannot be parsed are reported through the optional error callback as a [`FragmentError`](https://pkg.go.dev/github.com/xarantolus/jsonextract#FragmentError). Already delivered objects are not rolled back: extraction resynchronizes and continues with the bytes following the failed opening bracket, so later valid objects are still found. The wrapped cause is reachable via `errors.Is`/`errors.As`.
+
+```go
+err := jsonextract.Stream(r,
+    func(o jsonextract.Object) error {
+        // o.Raw is valid JSON, o.Source the original bytes at [o.Start, o.End)
+        fmt.Printf("object at bytes %d-%d: %s\n", o.Start, o.End, o.Raw)
+        return nil
+    },
+    func(fe jsonextract.FragmentError) error {
+        // A malformed fragment; extraction continues afterwards
+        fmt.Printf("invalid fragment at bytes %d-%d: %v\n", fe.Start, fe.End, fe.Err)
+        return nil
+    },
+    jsonextract.StreamOption{MaxObjects: 100}, // stop after 100 objects, remaining input is never read
+)
+```
+
+Returning [`ErrStop`](https://pkg.go.dev/github.com/xarantolus/jsonextract#ErrStop) from either callback stops extraction without an error, and `StreamOption{MaxObjects: n}` does the same automatically once `n` objects were delivered — in both cases the remaining stream is not read. `Reader` is implemented on top of `Stream`, so existing code keeps its exact behavior.
+
 ### Supported notations
 This software supports not just extracting normal JSON, but also other JavaScript notation.
 
@@ -91,13 +120,14 @@ results in
 
 
 ### Notes
-* While the functions take an `io.Reader` and stream data from it without buffering everything in memory, the underlying JS lexer uses `ioutil.ReadAll`. That means that this won't work well on files that are larger than memory.
-* It is possible to craft input in a way that will require the parser to revert a lot, which will take more time. One such input is repeating opening braces for arrays `[` without closing them, after more than a few thousand it gets noticeably slow.
+* Extraction is fully streaming: input is read incrementally and at most the bytes of the fragment (object or array) currently being scanned, plus a single 64 KiB read buffer, are held in memory. The whole input is never read at once, so files much larger than memory can be processed as long as each individual fragment fits.
+* A fragment that cannot be parsed is reported through the `Stream` error callback (or simply skipped by `Reader`) and its interior is rescanned, which allows valid objects nested inside or following it to be recovered. Pathological inputs such as thousands of unclosed opening brackets therefore cost rescanning time, but never cause previously delivered results to be rolled back.
 * When extracting objects from JavaScript files using [`Reader`](https://pkg.go.dev/github.com/xarantolus/jsonextract#Reader), you can end up with many arrays that look like `[0]`, `[1]`, `["i"]`, which is a result of indices being used in the script. You have to filter these out yourself.
 * While this package supports most number formats, there are some that don't work because the lexer doesn't support them. One of those is underscores in numbers. An example is that in JavaScript `2175` can be written as `2_175` or `0x8_7_f`, but that doesn't work here (normal HEX numbers do however). Another example are numbers with a leading zero; they are rejected by the lexer because it's not clear if they should be interpreted as octal or decimal.
 * Another example of unsupported number types are the float values `Inf`, `+Inf`, `-Inf` and other infinity values. While `NaN` is converted to `null` (as `NaN` is not valid JSON), infinity values don't have an appropriate JSON representation.
 
 ### Changelog
+* **Unreleased**: Add `Stream`, a true streaming extractor that only buffers the fragment currently being scanned and reports each object's original bytes and byte offsets (`Object`) as well as diagnostics for unparseable fragments (`FragmentError`), supports early stopping via `StreamOption{MaxObjects: ...}`. `Reader` is now implemented on top of it without changing its behavior
 * **v1.5.4**: Update underlying library, fix compilation due to breaking dependency change
 * **v1.5.3**: Support signed `+NaN` and `-NaN` by converting them to `null`, just like the normal `NaN`
 * **v1.5.2**: `Objects` now behaves as documented and only matches the first option found. This is useful for cascading options from the most keys to the least keys you want, which is useful if there is some overlap.

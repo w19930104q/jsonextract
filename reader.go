@@ -1,13 +1,11 @@
 package jsonextract
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strconv"
 	"strings"
 
@@ -41,204 +39,24 @@ type JSONCallback func([]byte) error
 
 // Reader reads all JSON and JavaScript objects from the input and calls callback for each of them.
 //
+// The input is processed as a stream: at most the bytes of the object or array
+// currently being scanned are held in memory. Use Stream if you additionally
+// need the original bytes, byte offsets or diagnostics for invalid fragments.
+//
 // Errors returned from the callback will stop the method.
 // The error will be returned, except if it is ErrStop which will cause the method to return nil.
 //
 // Please note that the reader must return UTF-8 bytes for this to work correctly.
-func Reader(reader io.Reader, callback JSONCallback) (err error) {
-
-	// Need to buffer in order to be able to unread invalid sections
-	buffered := newResettableBuffer(reader)
-
-	var r rune
-
-	for {
-		// Read character by character
-		r, _, err = buffered.ReadRune()
-		if err != nil {
-			break
-		}
-
-		// We're looking for opening brackets
-		if r == openArray || r == openObject {
-
-			// We go back one rune so the JavaScript decoder will also read the opening brace
-			err = buffered.UnreadRune()
-			if err != nil {
-				break
-			}
-
-			// Mark the start of our object. We can return here in case of errors
-			buffered.MarkStart()
-
-			var (
-				msg           []byte
-				readByteCount int
-			)
-
-			// Now we interpret the next bytes as JS object and convert them into JSON
-			// since readJSObject might return invalid JSON, we must check the output
-			msg, readByteCount, err = readJSObject(buffered)
-
-			if err != nil || !json.Valid(msg) {
-				// OK, so we tried to parse, but it didn't work.
-				// We now just skip this opening brace and check the following data
-				err = buffered.ReturnAndSkipOne()
-				if err != nil {
-					break
-				}
-
-				continue
-			}
-
-			// we read a certain amount of data that we should skip in the next round,
-			// but we should restore anything we read that wasn't part of the object we returned
-			// It is important to note that len(msg) is only equal to readByteCount if the
-			// original io.Reader already contained a valid JSON object, but not if it was an JS object
-			err = buffered.ReturnAndSkip(readByteCount)
-			if err != nil {
-				break
-			}
-
-			// Call the callback
-			err = callback(msg)
-			if err != nil {
-				// ErrStop just stops, returns nil
-				if err == ErrStop {
-					err = nil
-				}
-				// The returned error
-				return err
-			}
-
-			buffered.MarkEnd()
-		}
+func Reader(reader io.Reader, callback JSONCallback) error {
+	if callback == nil {
+		// Keep the old behaviour for a nil callback: still consume the whole
+		// stream so that reader errors surface, but discard all objects.
+		return Stream(reader, nil, nil)
 	}
 
-	if err == io.EOF {
-		err = nil
-	}
-
-	return
-}
-
-// resettableRuneBuffer allows reading from a buffer, then resetting certain parts
-type resettableRuneBuffer struct {
-	// normalBuffer is just the normal buffered reader. It is used because it allows unreading runes
-	normalBuffer *bufio.Reader
-
-	// bufBefore stores all data that was read until we return to the beginning of an object
-	bufBefore *bytes.Buffer
-
-	// returnBuffer contains the content of bufBefore after we returned to a certain part we read before
-	returnBuffer *bytes.Buffer
-
-	// enableReturn defines whether the buffer should log what is read through it.
-	// if true, one can return to any position after it was enabled
-	enableReturn bool
-}
-
-func newResettableBuffer(r io.Reader) *resettableRuneBuffer {
-	bir, ok := r.(*bufio.Reader)
-	if !ok {
-		bir = bufio.NewReader(r)
-	}
-
-	return &resettableRuneBuffer{
-		normalBuffer: bir,
-		returnBuffer: new(bytes.Buffer),
-		bufBefore:    new(bytes.Buffer),
-	}
-}
-
-// Read implements io.Reader
-func (s *resettableRuneBuffer) Read(p []byte) (n int, err error) {
-	n, _ = s.returnBuffer.Read(p)
-
-	if n < len(p) {
-		n2, err2 := s.normalBuffer.Read(p[n:])
-
-		n += n2
-		err = err2
-	}
-
-	if s.enableReturn {
-		s.bufBefore.Write(p[:n])
-	}
-
-	return n, err
-}
-
-// ReadRune reads exactly one rune
-func (s *resettableRuneBuffer) ReadRune() (r rune, size int, err error) {
-	r, size, err = s.returnBuffer.ReadRune()
-	if err != nil {
-		r, size, err = s.normalBuffer.ReadRune()
-	}
-
-	if s.enableReturn {
-		s.bufBefore.WriteRune(r)
-	}
-
-	return
-}
-
-// UnreadRune unreads the last rune read with ReadRune
-func (s *resettableRuneBuffer) UnreadRune() (err error) {
-	if s.enableReturn {
-		_ = s.bufBefore.UnreadRune()
-	}
-
-	err = s.returnBuffer.UnreadRune()
-	if err == nil {
-		return
-	}
-
-	return s.normalBuffer.UnreadRune()
-}
-
-// ReturnAndSkipOne returns the buffer to the last reset (or initial) from an outside perspective,
-// except that it skips one rune from the underlying stream
-func (s *resettableRuneBuffer) ReturnAndSkipOne() (err error) {
-	s.returnBuffer = s.bufBefore
-
-	// Skip one rune
-	_, _, err = s.returnBuffer.ReadRune()
-
-	s.bufBefore = new(bytes.Buffer)
-
-	return
-}
-
-// ReturnAndSkip returns the buffer to the last reset (or initial) from an outside perspective,
-// except that it skips `offset` bytes from the input
-func (s *resettableRuneBuffer) ReturnAndSkip(offset int) (err error) {
-	s.returnBuffer = s.bufBefore
-
-	if offset > 0 {
-		_, err = io.CopyN(ioutil.Discard, s.returnBuffer, int64(offset))
-	}
-
-	s.bufBefore = new(bytes.Buffer)
-
-	return
-}
-
-// MarkStart marks a restart point. When calling a return method, this
-// start will be used
-func (s *resettableRuneBuffer) MarkStart() {
-	s.enableReturn = true
-	s.bufBefore.Reset()
-}
-
-// MarkEnd disables returning until MarkStart is called the next time
-func (s *resettableRuneBuffer) MarkEnd() {
-	s.enableReturn = false
-	// bufBefore.Len() == 0 at this moment
-
-	if s.bufBefore.Len() != 0 {
-		panic("wrong use of resettableRuneBuffer")
-	}
+	return Stream(reader, func(o Object) error {
+		return callback(o.Raw)
+	}, nil)
 }
 
 var jsIdentifiers = map[string][]byte{
@@ -268,13 +86,15 @@ var templateQuoteReplacer = strings.NewReplacer(
 	"\\`", "`",
 )
 
-// readJSObject converts the input data from `r` to JSON if possible.
-// Input data should either already be JSON or a JavaScript object declaration.
+// readJSObject converts a single fragment of JavaScript object or array
+// notation to JSON if possible.
+// The fragment must contain exactly one complete or truncated object or array,
+// as delimited by the streaming scanner.
 // Please note that output might not be valid JSON and should be checked using json.Valid()
-func readJSObject(r io.Reader) (output []byte, readInputBytes int, err error) {
-	// Note: the current implementation of NewInput reads all bytes in the reader,
-	// which is problematic for large files
-	lex := js.NewLexer(parse.NewInput(r))
+func readJSObject(fragment []byte) (output []byte, err error) {
+	// Only this single fragment is materialized in memory; the surrounding
+	// stream is never read into memory at once.
+	lex := js.NewLexer(parse.NewInputBytes(fragment))
 
 	// buf stores the bytes that should be returned in output
 	var buf = new(bytes.Buffer)
@@ -282,8 +102,9 @@ func readJSObject(r io.Reader) (output []byte, readInputBytes int, err error) {
 	var (
 		// since it's a dyck language, we just count the level of braces.
 		// If we reach zero, we can stop parsing as we know this is the end of this object
-		first byte
-		level int
+		first      byte
+		firstToken bool
+		level      int
 	)
 
 	// lastByte stores the last byte we wrote to buf
@@ -304,11 +125,10 @@ loop:
 		// The following code assumes len(text) > 0
 
 		// First will always be either '{' or '['
-		if readInputBytes == 0 {
+		if !firstToken {
 			first = text[0]
+			firstToken = true
 		}
-
-		readInputBytes += len(text)
 
 		switch {
 		case isIgnoredToken(tt):
@@ -465,9 +285,9 @@ loop:
 	}
 
 	if err == nil || err == io.EOF {
-		return buf.Bytes(), readInputBytes, nil
+		return buf.Bytes(), nil
 	}
-	return nil, 0, err
+	return nil, err
 }
 
 func isIgnoredToken(tt js.TokenType) bool {

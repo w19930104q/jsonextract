@@ -39,4 +39,10 @@
 //
 // Objects is a high-level function for easily extracting certain objects no matter their position within any other object.
 // Reader is a lower-level function that gives you more control over how you process objects and arrays.
+//
+// Both are backed by Stream, which implements the actual streaming extraction: it reads the input incrementally and
+// only keeps the fragment currently being scanned in memory. In addition to the converted JSON bytes, Stream reports
+// each Object's original source bytes and its half-open byte offset interval, reports unparseable fragments through a
+// FragmentError callback without rolling back objects already delivered, and can stop early via StreamOption.MaxObjects
+// or by returning ErrStop from a callback.
 package jsonextract
